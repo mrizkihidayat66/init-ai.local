@@ -41,6 +41,7 @@ export async function repairMermaidWithAi(input: RepairMermaidInput): Promise<Re
   const maxRetries = input.maxRetries ?? 3;
   let current = autoFixMermaidCode(input.rawCode) || input.rawCode.trim();
   let parseResult = await parseMermaidServer(current);
+  let previousInvalid = current;
 
   if (parseResult.valid) {
     return { code: current, repaired: false, valid: true, attempts: 0 };
@@ -67,7 +68,11 @@ ${current}`,
 
     const candidate = autoFixMermaidCode(text.trim());
     if (candidate) {
+      if (candidate.trim() === previousInvalid.trim()) {
+        break;
+      }
       current = candidate;
+      previousInvalid = candidate;
     }
 
     parseResult = await parseMermaidServer(current);

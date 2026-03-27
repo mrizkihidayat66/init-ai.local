@@ -50,14 +50,34 @@ export function SettingsDialog({
   const [modelTagInput, setModelTagInput] = useState('');
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<'idle' | 'saved' | 'error'>('idle');
+
+  async function readJsonSafe(response: Response): Promise<Record<string, unknown> | null> {
+    const text = await response.text();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
   // Fetch the specific provider's settings when dialog opens or provider dropdown changes
   useEffect(() => {
     if (open) {
       setApiKeyInput(''); // Clear whenever we load
       fetch(`/api/settings?provider=${settings.provider}`)
-        .then((r) => r.json())
-        .then((data) => {
-          setSettings(data.settings);
+        .then(async (r) => ({ ok: r.ok, data: await readJsonSafe(r) }))
+        .then(({ ok, data }) => {
+          if (!ok || !data?.settings) {
+            throw new Error(
+              (typeof data?.error === 'string' ? data.error : null) ||
+              'Failed to load settings'
+            );
+          }
+          setSettings(data.settings as SettingsData);
+        })
+        .catch((error) => {
+          console.error('Failed to load settings', error);
         });
     }
   }, [open, settings.provider]);
@@ -109,8 +129,16 @@ export function SettingsDialog({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      setTestResult(data);
+      const data = await readJsonSafe(res);
+      setTestResult(
+        data
+          ? {
+              success: Boolean(data.success),
+              text: typeof data.text === 'string' ? data.text : undefined,
+              error: typeof data.error === 'string' ? data.error : undefined,
+            }
+          : { success: false, error: 'Empty response from test endpoint' }
+      );
     } catch (error: any) {
       setTestResult({ success: false, error: error.message });
     }

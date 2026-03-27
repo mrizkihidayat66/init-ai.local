@@ -32,14 +32,31 @@ export default function DashboardPage() {
     fetchProjects();
   }, []);
 
+  async function readJsonSafe(response: Response): Promise<Record<string, unknown> | null> {
+    const text = await response.text();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
   async function fetchProjects() {
     setLoading(true);
     try {
       const res = await fetch('/api/projects', { cache: 'no-store', next: { revalidate: 0 } });
-      const data = await res.json();
-      setProjects(data.projects || []);
+      const data = await readJsonSafe(res);
+      if (!res.ok) {
+        throw new Error(
+          (typeof data?.error === 'string' ? data.error : null) ||
+            `Failed to fetch projects (${res.status})`
+        );
+      }
+      setProjects(Array.isArray(data?.projects) ? (data.projects as ProjectSummary[]) : []);
     } catch (error) {
       console.error('Failed to fetch projects', error);
+      setProjects([]);
     }
     setLoading(false);
   }
@@ -50,8 +67,18 @@ export default function DashboardPage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'New Project', description: '' }),
     });
-    const data = await res.json();
-    router.push(`/new?projectId=${data.project.id}`);
+    const data = await readJsonSafe(res);
+    const projectId =
+      data && typeof data.project === 'object' && data.project !== null && 'id' in data.project
+        ? (data.project as { id?: string }).id
+        : undefined;
+    if (!res.ok || !projectId) {
+      throw new Error(
+        (typeof data?.error === 'string' ? data.error : null) ||
+          `Failed to create project (${res.status})`
+      );
+    }
+    router.push(`/new?projectId=${projectId}`);
   }
 
   async function deleteProject(e: React.MouseEvent, id: string) {
@@ -73,8 +100,14 @@ export default function DashboardPage() {
       await fetch(`/api/projects/${id}`, { method: 'DELETE' });
       // Background re-sync
       const res = await fetch('/api/projects', { cache: 'no-store', next: { revalidate: 0 } });
-      const data = await res.json();
-      setProjects(data.projects || []);
+      const data = await readJsonSafe(res);
+      if (!res.ok) {
+        throw new Error(
+          (typeof data?.error === 'string' ? data.error : null) ||
+            `Failed to re-sync projects (${res.status})`
+        );
+      }
+      setProjects(Array.isArray(data?.projects) ? (data.projects as ProjectSummary[]) : []);
     } catch (error) {
       console.error('Failed to delete', error);
       fetchProjects(); // Revert on failure
@@ -87,8 +120,18 @@ export default function DashboardPage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Test: Todo App', description: 'A test project to verify the pipeline' }),
     });
-    const data = await res.json();
-    router.push(`/new?projectId=${data.project.id}&testMode=true`);
+    const data = await readJsonSafe(res);
+    const projectId =
+      data && typeof data.project === 'object' && data.project !== null && 'id' in data.project
+        ? (data.project as { id?: string }).id
+        : undefined;
+    if (!res.ok || !projectId) {
+      throw new Error(
+        (typeof data?.error === 'string' ? data.error : null) ||
+          `Failed to create test project (${res.status})`
+      );
+    }
+    router.push(`/new?projectId=${projectId}&testMode=true`);
   }
 
   const filtered = projects.filter(

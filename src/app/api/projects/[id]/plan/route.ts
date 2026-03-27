@@ -5,6 +5,7 @@ import { getSettings, getModel } from '@/lib/ai/provider';
 import { PLAN_SECTIONS, getSectionSystemPrompt } from '@/lib/ai/prompts/generate-plan';
 import { normalizeMermaidMarkdown } from '@/lib/ai/mermaid';
 import { repairMermaidWithAi } from '@/lib/ai/mermaid-pipeline';
+import { generateDbSchemaMarkdown, generatePlanDiagramsMarkdown } from '@/lib/ai/diagram-generator';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -41,7 +42,7 @@ async function fixInvalidMermaidBlocks(
   section: 'diagrams' | 'dbSchema'
 ): Promise<string> {
   let current = normalizeMermaidMarkdown(content);
-  const maxRetries = 2;
+  const maxRetries = 3;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const blocks = getMermaidBlocks(current);
@@ -51,17 +52,25 @@ async function fixInvalidMermaidBlocks(
 
     // Process blocks back-to-front so string offsets stay valid.
     for (const block of [...blocks].reverse()) {
+      const before = block.code.trim();
       const result = await repairMermaidWithAi({
         rawCode: block.code,
         model,
         section,
-        maxRetries: 2,
+        maxRetries: 3,
       });
+
+      console.log(
+        `[PLAN][${section}] Mermaid repair block=${block.index} valid=${result.valid} attempts=${result.attempts} repaired=${result.repaired}`
+      );
 
       if (result.valid) {
         const replacement = `\`\`\`mermaid\n${result.code}\n\`\`\``;
         current = current.slice(0, block.start) + replacement + current.slice(block.end);
         anyFixed = true;
+        if (result.code.trim() === before && result.repaired) {
+          console.log(`[PLAN][${section}] Mermaid repair converged without changing block=${block.index}`);
+        }
       }
     }
 
@@ -70,6 +79,36 @@ async function fixInvalidMermaidBlocks(
   }
 
   return current;
+}
+
+async function generateDiagramSectionContent(
+  section: 'diagrams' | 'dbSchema',
+  model: ReturnType<typeof getModel>,
+  settings: Awaited<ReturnType<typeof getSettings>>,
+  conversationContext: string,
+  projectName: string,
+  projectDescription: string | null,
+  supportingDocuments?: string
+): Promise<string> {
+  if (section === 'diagrams') {
+    return await generatePlanDiagramsMarkdown({
+      model,
+      temperature: settings.temperature,
+      conversationContext,
+      projectName,
+      projectDescription: projectDescription || '',
+      supportingDocuments,
+    });
+  }
+
+  return await generateDbSchemaMarkdown({
+    model,
+    temperature: settings.temperature,
+    conversationContext,
+    projectName,
+    projectDescription: projectDescription || '',
+    supportingDocuments,
+  });
 }
 
 // POST /api/projects/:id/plan - Generate or regenerate plan (section-by-section)
@@ -101,6 +140,7 @@ export async function POST(request: NextRequest, { params }: Params) {
 
   const sectionsGenerated: string[] = [];
   const sectionsFailed: string[] = [];
+  const sectionContent = new Map<string, string>();
 
   // Ensure the plan row exists
   const existingPlan = await prisma.plan.upsert({
@@ -148,22 +188,40 @@ export async function POST(request: NextRequest, { params }: Params) {
     console.log(`[PLAN] Generating section: ${section} ...`);
 
     try {
-      const { text } = await generateText({
-        model,
-        system: getSectionSystemPrompt(section),
-        prompt: `Here is the full conversation with the user about their project:\n\n${conversationContext}\n\nProject Name: ${project.name}\nProject Description: ${project.description || 'N/A'}\n\nWrite the "${section}" section now.`,
-        temperature: settings.temperature,
-      });
-
-      // Clean up: strip markdown code fences if the model wraps it
-      let content = text.trim();
-      const fenceMatch = content.match(/^```(?:markdown|md)?\s*\n?([\s\S]*?)```\s*$/);
-      if (fenceMatch) {
-        content = fenceMatch[1].trim();
-      }
+      let content = '';
 
       if (section === 'diagrams' || section === 'dbSchema') {
-        content = await fixInvalidMermaidBlocks(content, model, section);
+        const supportingDocuments = ['prd', 'architecture', 'apiSpec', 'workflow', 'dbSchema']
+          .filter((key) => key !== section)
+          .map((key) => {
+            const value = sectionContent.get(key);
+            return value ? `## ${key}\n${value}` : '';
+          })
+          .filter(Boolean)
+          .join('\n\n');
+
+        content = await generateDiagramSectionContent(
+          section,
+          model,
+          settings,
+          conversationContext,
+          project.name,
+          project.description,
+          supportingDocuments
+        );
+      } else {
+        const { text } = await generateText({
+          model,
+          system: getSectionSystemPrompt(section),
+          prompt: `Here is the full conversation with the user about their project:\n\n${conversationContext}\n\nProject Name: ${project.name}\nProject Description: ${project.description || 'N/A'}\n\nWrite the "${section}" section now.`,
+          temperature: settings.temperature,
+        });
+
+        content = text.trim();
+        const fenceMatch = content.match(/^```(?:markdown|md)?\s*\n?([\s\S]*?)```\s*$/);
+        if (fenceMatch) {
+          content = fenceMatch[1].trim();
+        }
       }
 
       // Save this section immediately to the DB
@@ -173,6 +231,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       });
 
       sectionsGenerated.push(section);
+  sectionContent.set(section, content);
       console.log(`[PLAN] ✅ Section "${section}" saved (${content.length} chars)`);
     } catch (error) {
       console.error(`[PLAN] ❌ Section "${section}" failed:`, error);
