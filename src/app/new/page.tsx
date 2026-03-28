@@ -103,7 +103,7 @@ function NewProjectContent() {
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, generatingPlan, planProgress]);
 
   function tryParseAI(content: string): ParsedAIResponse | null {
     if (!content) return null;

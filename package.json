@@ -19,7 +19,8 @@
     "setup:env": "node scripts/setup-env.mjs",
     "setup:api-key": "node scripts/setup-api-key.mjs",
     "setup:doctor": "node scripts/setup-doctor.mjs",
-    "setup": "npm run setup:env && npm run setup:doctor && npm run db:generate"
+    "setup": "npm run setup:env && npm run setup:doctor && npm run db:generate",
+    "record-demo": "node scripts/record-demo.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.63",
@@ -47,6 +48,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
@@ -54,6 +56,7 @@
     "@types/uuid": "^10.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.1",
+    "playwright": "^1.58.2",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^4.1.0"
