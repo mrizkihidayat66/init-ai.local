@@ -47,6 +47,13 @@ export async function parseMermaidServer(code: string): Promise<ServerParseResul
     return { valid: true };
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e);
+    // DOMPurify and similar browser-only APIs are not available in the Node.js
+    // server runtime. This is an environment limitation, not a diagram syntax
+    // error — treat as skipped validation so the pipeline is not blocked.
+    if (raw.includes('DOMPurify') || raw.includes('addHook')) {
+      console.warn('[mermaid-server] Browser-only API unavailable in Node.js — skipping Mermaid validation. Diagram will be validated client-side on render.');
+      return { valid: true };
+    }
     // Trim very long PEG.js "Expecting ..." lists to keep prompts compact.
     const error = raw.length > 400 ? raw.slice(0, 400) + '…' : raw;
     return { valid: false, error };

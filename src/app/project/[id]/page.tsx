@@ -7,8 +7,9 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { MermaidRenderer } from '@/components/mermaid-renderer';
@@ -53,6 +54,7 @@ type PlanSnapshot = {
   id: string;
   version: number;
   createdAt: string;
+  sections: string[];
 };
 
 export default function ProjectDetailPage({
@@ -70,18 +72,17 @@ export default function ProjectDetailPage({
   const [editContent, setEditContent] = useState('');
   const [saving, setSaving] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
+  const [showRegenerateDialog, setShowRegenerateDialog] = useState(false);
+  const [sectionsToRegenerate, setSectionsToRegenerate] = useState<PlanSection[]>(
+    Object.keys(PLAN_SECTION_LABELS) as PlanSection[]
+  );
   const [deleting, setDeleting] = useState(false);
   const [autopilotStep, setAutopilotStep] = useState(0);
   const [snapshots, setSnapshots] = useState<PlanSnapshot[]>([]);
-  const [showHistory, setShowHistory] = useState(false);
+  const [showHistoryDialog, setShowHistoryDialog] = useState(false);
+  const [confirmRestoreId, setConfirmRestoreId] = useState<string | null>(null);
+  const [deletingSnapshotId, setDeletingSnapshotId] = useState<string | null>(null);
   const [restoring, setRestoring] = useState(false);
-
-  useEffect(() => {
-    fetchProject();
-    fetchCommits();
-    fetchContextLogs();
-    fetchSnapshots();
-  }, [id]);
 
   async function fetchProject() {
     setLoading(true);
@@ -112,8 +113,17 @@ export default function ProjectDetailPage({
     });
     await fetchProject();
     await fetchSnapshots();
-    setShowHistory(false);
+    setShowHistoryDialog(false);
+    setConfirmRestoreId(null);
     setRestoring(false);
+  }
+
+  async function handleDeleteSnapshot(snapshotId: string) {
+    await fetch(`/api/projects/${id}/plan/snapshots?snapshotId=${snapshotId}`, {
+      method: 'DELETE',
+    });
+    setDeletingSnapshotId(null);
+    await fetchSnapshots();
   }
 
   async function fetchContextLogs() {
@@ -121,6 +131,14 @@ export default function ProjectDetailPage({
     const data = await res.json();
     setContextLogs(data.logs || []);
   }
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchProject();
+    fetchCommits();
+    fetchContextLogs();
+    fetchSnapshots();
+  }, [id]);
 
   // --- FULL E2E AUTOPILOT ---
   useEffect(() => {
@@ -143,7 +161,7 @@ export default function ProjectDetailPage({
       setAutopilotStep(6);
       log(6, 'Editing PRD section...');
       try {
-        const currentPlan = project?.plan as any;
+        const currentPlan = project?.plan as Record<string, string | number | null> | null;
         await fetch(`/api/projects/${id}/plan`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -244,11 +262,38 @@ export default function ProjectDetailPage({
     }
   }
 
-  async function handleRegenerate() {
+  async function handleRegenerate(sections?: PlanSection[]) {
     setRegenerating(true);
-    await fetch(`/api/projects/${id}/plan`, { method: 'POST' });
+    const body = sections && sections.length > 0 ? JSON.stringify({ sections }) : undefined;
+    await fetch(`/api/projects/${id}/plan`, {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body,
+    });
     await fetchProject();
     setRegenerating(false);
+  }
+
+  function toggleSectionForRegeneration(section: PlanSection) {
+    setSectionsToRegenerate((prev) =>
+      prev.includes(section) ? prev.filter((s) => s !== section) : [...prev, section]
+    );
+  }
+
+  function openRegenerateDialog() {
+    const available = (Object.keys(PLAN_SECTION_LABELS) as PlanSection[]).filter((key) =>
+      project?.plan ? key in project.plan : true
+    );
+    setSectionsToRegenerate(available.length > 0 ? available : (Object.keys(PLAN_SECTION_LABELS) as PlanSection[]));
+    setShowRegenerateDialog(true);
+  }
+
+  async function handleConfirmRegenerate() {
+    if (sectionsToRegenerate.length === 0) {
+      return;
+    }
+    setShowRegenerateDialog(false);
+    await handleRegenerate(sectionsToRegenerate);
   }
 
   async function handleSaveSection() {
@@ -328,39 +373,19 @@ export default function ProjectDetailPage({
           <div className="flex items-center gap-2">
             {project.plan && (
               <>
-                <div className="relative">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setShowHistory(!showHistory)}
-                    className="border-border/50"
-                    disabled={snapshots.length === 0}
-                  >
-                    📜 History ({snapshots.length})
-                  </Button>
-                  {showHistory && snapshots.length > 0 && (
-                    <div className="absolute right-0 top-full mt-2 w-72 bg-card border border-border/50 rounded-xl shadow-2xl z-50 overflow-hidden">
-                      <div className="px-3 py-2 border-b border-border/30 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Plan History</div>
-                      <div className="max-h-60 overflow-auto">
-                        {snapshots.map((snap) => (
-                          <button
-                            key={snap.id}
-                            onClick={() => handleRestoreSnapshot(snap.id)}
-                            disabled={restoring}
-                            className="w-full text-left px-3 py-2 hover:bg-muted/50 transition-colors flex items-center justify-between text-sm border-b border-border/20 last:border-b-0"
-                          >
-                            <span className="text-muted-foreground">v{snap.version}</span>
-                            <span className="text-xs text-muted-foreground/60">{new Date(snap.createdAt).toLocaleString()}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleRegenerate}
+                  onClick={() => { setConfirmRestoreId(null); setDeletingSnapshotId(null); setShowHistoryDialog(true); }}
+                  className="border-border/50"
+                  disabled={snapshots.length === 0}
+                >
+                  📜 History ({snapshots.length})
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={openRegenerateDialog}
                   disabled={regenerating}
                   className="border-border/50"
                 >
@@ -429,7 +454,7 @@ export default function ProjectDetailPage({
                   <div className="text-4xl mb-4">📝</div>
                   <p className="text-muted-foreground mb-4">No plan generated yet.</p>
                   <Button
-                    onClick={handleRegenerate}
+                    onClick={() => handleRegenerate()}
                     disabled={regenerating}
                     className="bg-gradient-to-r from-violet-600 to-cyan-600 text-white"
                   >
@@ -649,6 +674,174 @@ export default function ProjectDetailPage({
           </TabsContent>
         </Tabs>
       </main>
+
+      <Dialog open={showHistoryDialog} onOpenChange={setShowHistoryDialog}>
+        <DialogContent className="sm:max-w-xl bg-card/95 backdrop-blur-xl border-border/40">
+          <DialogHeader>
+            <DialogTitle>Plan History</DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-2 max-h-[480px] overflow-auto py-1 pr-1">
+            {snapshots.length === 0 && (
+              <p className="text-sm text-center text-muted-foreground py-6">No saved snapshots.</p>
+            )}
+            {snapshots.map((snap) => (
+              <div key={snap.id} className="border border-border/30 rounded-lg p-3 space-y-2 bg-muted/10">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1.5 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline" className="font-mono text-xs">v{snap.version}</Badge>
+                      <span className="text-xs text-muted-foreground">{new Date(snap.createdAt).toLocaleString()}</span>
+                    </div>
+                    {snap.sections.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {snap.sections.map((s) => (
+                          <Badge key={s} variant="secondary" className="text-[10px] px-1.5 py-0">
+                            {PLAN_SECTION_LABELS[s as PlanSection] || s}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground/50 italic">No section content</span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1 shrink-0">
+                    {confirmRestoreId === snap.id ? (
+                      <>
+                        <span className="text-xs text-muted-foreground">Overwrite current plan?</span>
+                        <Button
+                          size="sm"
+                          disabled={restoring}
+                          onClick={() => handleRestoreSnapshot(snap.id)}
+                          className="bg-violet-600 hover:bg-violet-700 text-white text-xs h-7 px-2"
+                        >
+                          {restoring ? '...' : 'Yes, restore'}
+                        </Button>
+                        <Button size="sm" variant="ghost" className="text-xs h-7 px-2" onClick={() => setConfirmRestoreId(null)}>
+                          Cancel
+                        </Button>
+                      </>
+                    ) : deletingSnapshotId === snap.id ? (
+                      <>
+                        <span className="text-xs text-muted-foreground">Delete this entry?</span>
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          className="text-xs h-7 px-2"
+                          onClick={() => handleDeleteSnapshot(snap.id)}
+                        >
+                          Delete
+                        </Button>
+                        <Button size="sm" variant="ghost" className="text-xs h-7 px-2" onClick={() => setDeletingSnapshotId(null)}>
+                          Cancel
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="text-xs h-7 px-2"
+                          disabled={restoring}
+                          onClick={() => { setDeletingSnapshotId(null); setConfirmRestoreId(snap.id); }}
+                        >
+                          Restore
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-xs h-7 px-2 text-red-400 hover:text-red-300 hover:bg-red-400/10"
+                          onClick={() => { setConfirmRestoreId(null); setDeletingSnapshotId(snap.id); }}
+                        >
+                          🗑️
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showRegenerateDialog} onOpenChange={setShowRegenerateDialog}>
+        <DialogContent className="sm:max-w-lg bg-card/95 backdrop-blur-xl border-border/40">
+          <DialogHeader>
+            <DialogTitle>Regenerate Plan Sections</DialogTitle>
+          </DialogHeader>
+
+          <div className="space-y-3 py-1">
+            <p className="text-sm text-muted-foreground">
+              Select the sections to regenerate. Unselected sections will be kept as-is.
+            </p>
+
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setSectionsToRegenerate(Object.keys(PLAN_SECTION_LABELS) as PlanSection[])}
+                disabled={regenerating}
+              >
+                Select All
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setSectionsToRegenerate([])}
+                disabled={regenerating}
+              >
+                Clear
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-72 overflow-auto border border-border/30 rounded-lg p-3 bg-muted/20">
+              {(Object.keys(PLAN_SECTION_LABELS) as PlanSection[]).map((section) => {
+                const checked = sectionsToRegenerate.includes(section);
+                return (
+                  <Label
+                    key={section}
+                    className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/40 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleSectionForRegeneration(section)}
+                      className="h-4 w-4 accent-violet-500"
+                    />
+                    <span className="text-sm">{PLAN_SECTION_LABELS[section]}</span>
+                  </Label>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <span className="text-xs text-muted-foreground">
+                {sectionsToRegenerate.length} selected
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setShowRegenerateDialog(false)}
+                  disabled={regenerating}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={handleConfirmRegenerate}
+                  disabled={regenerating || sectionsToRegenerate.length === 0}
+                  className="bg-gradient-to-r from-violet-600 to-cyan-600 text-white"
+                >
+                  {regenerating ? 'Regenerating...' : 'Regenerate Selected'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

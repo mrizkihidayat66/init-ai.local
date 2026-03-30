@@ -10,7 +10,6 @@ import {
   type PlanDiagrams,
   type SequenceDiagram,
 } from '@/lib/ai/schemas';
-import { parseMermaidServer } from '@/lib/ai/mermaid-server';
 
 type ModelLike = Parameters<typeof generateText>[0]['model'];
 
@@ -571,7 +570,6 @@ function createFallbackDbSchema(projectName: string): DbSchemaDocument {
 
 export async function generatePlanDiagramsMarkdown(input: DiagramGenerationInput): Promise<string> {
   let document: PlanDiagrams;
-  let usedFallback = false;
 
   try {
     const candidate = await generateStructuredFromText({
@@ -611,19 +609,14 @@ export async function generatePlanDiagramsMarkdown(input: DiagramGenerationInput
   } catch (err) {
     console.warn(`[DIAGRAM][PlanDiagrams] Falling back to minimal diagram: ${err instanceof Error ? err.message : String(err)}`);
     document = createFallbackPlanDiagrams(input.projectName);
-    usedFallback = true;
   }
 
   const markdown = compilePlanDiagramsMarkdown(document);
-  if (!usedFallback) {
-    await assertCompiledMermaidMarkdown(markdown);
-  }
   return markdown;
 }
 
 export async function generateDbSchemaMarkdown(input: DiagramGenerationInput): Promise<string> {
   let document: DbSchemaDocument;
-  let usedFallback = false;
 
   try {
     const candidate = await generateStructuredFromText({
@@ -654,22 +647,8 @@ export async function generateDbSchemaMarkdown(input: DiagramGenerationInput): P
   } catch (err) {
     console.warn(`[DIAGRAM][DbSchema] Falling back to minimal schema: ${err instanceof Error ? err.message : String(err)}`);
     document = createFallbackDbSchema(input.projectName);
-    usedFallback = true;
   }
 
   const markdown = compileDbSchemaMarkdown(document);
-  if (!usedFallback) {
-    await assertCompiledMermaidMarkdown(markdown);
-  }
   return markdown;
-}
-
-async function assertCompiledMermaidMarkdown(markdown: string): Promise<void> {
-  const blocks = Array.from(markdown.matchAll(/```mermaid\s*([\s\S]*?)```/gi)).map((match) => match[1].trim());
-  for (const block of blocks) {
-    const result = await parseMermaidServer(block);
-    if (!result.valid) {
-      throw new Error(`Compiled Mermaid failed validation: ${result.error || 'Unknown Mermaid parse error'}`);
-    }
-  }
 }

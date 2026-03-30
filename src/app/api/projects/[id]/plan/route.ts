@@ -2,12 +2,68 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
 import { generateText } from 'ai';
 import { getSettings, getModel } from '@/lib/ai/provider';
-import { PLAN_SECTIONS, getSectionSystemPrompt } from '@/lib/ai/prompts/generate-plan';
+import { PLAN_SECTIONS, getSectionSystemPrompt, type PlanSectionKey } from '@/lib/ai/prompts/generate-plan';
 import { normalizeMermaidMarkdown } from '@/lib/ai/mermaid';
 import { repairMermaidWithAi } from '@/lib/ai/mermaid-pipeline';
 import { generateDbSchemaMarkdown, generatePlanDiagramsMarkdown } from '@/lib/ai/diagram-generator';
 
 type Params = { params: Promise<{ id: string }> };
+
+const SECTION_KEYS = ['prd', 'architecture', 'taskList', 'apiSpec', 'dbSchema', 'rules', 'workflow', 'diagrams', 'promptContext', 'effortEstimate'] as const;
+const LOCAL_CONTEXT_MAX_CHARS = 14000;
+const CLOUD_CONTEXT_MAX_CHARS = 26000;
+
+function isPlanSectionKey(value: string): value is PlanSectionKey {
+  return (PLAN_SECTIONS as readonly string[]).includes(value);
+}
+
+function parseRequestedSections(body: unknown): PlanSectionKey[] {
+  if (!body || typeof body !== 'object' || !("sections" in body)) {
+    return [...PLAN_SECTIONS];
+  }
+
+  const incoming = (body as { sections?: unknown }).sections;
+  if (!Array.isArray(incoming)) {
+    return [...PLAN_SECTIONS];
+  }
+
+  const unique = Array.from(new Set(incoming.filter((item): item is string => typeof item === 'string')));
+  const valid = unique.filter(isPlanSectionKey);
+  return valid.length > 0 ? valid : [...PLAN_SECTIONS];
+}
+
+function getConversationContextMaxChars(provider: string): number {
+  if (provider === 'lmstudio' || provider === 'ollama') {
+    return LOCAL_CONTEXT_MAX_CHARS;
+  }
+  return CLOUD_CONTEXT_MAX_CHARS;
+}
+
+function buildConversationContext(
+  conversations: Array<{ role: string; content: string }>,
+  maxChars: number
+): string {
+  const parts: string[] = [];
+  let total = 0;
+
+  for (let i = conversations.length - 1; i >= 0; i -= 1) {
+    const c = conversations[i];
+    const piece = `${c.role}: ${c.content}`;
+    const nextTotal = total + piece.length + (parts.length > 0 ? 2 : 0);
+    if (parts.length > 0 && nextTotal > maxChars) {
+      break;
+    }
+    parts.unshift(piece);
+    total = nextTotal;
+  }
+
+  return parts.join('\n\n');
+}
+
+function isTimeoutLikeError(error: unknown): boolean {
+  const message = String(error || '').toLowerCase();
+  return message.includes('timeout') || message.includes('headers timeout');
+}
 
 type MermaidBlock = {
   index: number;
@@ -114,6 +170,15 @@ async function generateDiagramSectionContent(
 // POST /api/projects/:id/plan - Generate or regenerate plan (section-by-section)
 export async function POST(request: NextRequest, { params }: Params) {
   const { id } = await params;
+  let requestBody: unknown = null;
+
+  try {
+    requestBody = await request.json();
+  } catch {
+    requestBody = null;
+  }
+
+  const requestedSections = parseRequestedSections(requestBody);
 
   const project = await prisma.project.findUnique({
     where: { id },
@@ -124,13 +189,17 @@ export async function POST(request: NextRequest, { params }: Params) {
     return NextResponse.json({ error: 'Project not found' }, { status: 404 });
   }
 
-  // Build the requirements summary from conversation history
-  const conversationContext = project.conversations
-    .map((c) => `${c.role}: ${c.content}`)
-    .join('\n\n');
-
   const settings = await getSettings();
   const model = getModel(settings);
+  const contextMaxChars = getConversationContextMaxChars(settings.provider);
+  const conversationContext = buildConversationContext(
+    project.conversations,
+    contextMaxChars
+  );
+  const compactConversationContext = buildConversationContext(
+    project.conversations,
+    Math.max(5000, Math.floor(contextMaxChars * 0.5))
+  );
 
   // Failsafe: ensure status is at least REQUIREMENTS_LOCKED before generating
   await prisma.project.update({
@@ -150,9 +219,8 @@ export async function POST(request: NextRequest, { params }: Params) {
   });
 
   // Snapshot the existing plan before overwriting (if it has any content)
-  const sectionKeys = ['prd', 'architecture', 'taskList', 'apiSpec', 'dbSchema', 'rules', 'workflow', 'diagrams', 'promptContext', 'effortEstimate'] as const;
-  type SectionKey = (typeof sectionKeys)[number];
-  const hasContent = sectionKeys.some((k) => {
+  type SectionKey = (typeof SECTION_KEYS)[number];
+  const hasContent = SECTION_KEYS.some((k) => {
     const value = existingPlan[k as keyof typeof existingPlan];
     return typeof value === 'string' && value.length > 0;
   });
@@ -169,7 +237,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       promptContext: null,
       effortEstimate: null,
     };
-    for (const k of sectionKeys) {
+    for (const k of SECTION_KEYS) {
       const value = existingPlan[k as keyof typeof existingPlan];
       snapshot[k] = typeof value === 'string' ? value : null;
     }
@@ -183,45 +251,82 @@ export async function POST(request: NextRequest, { params }: Params) {
     console.log(`[PLAN] Snapshot saved: v${existingPlan.version}`);
   }
 
+  for (const key of SECTION_KEYS) {
+    const value = existingPlan[key as keyof typeof existingPlan];
+    if (typeof value === 'string' && value.length > 0) {
+      sectionContent.set(key, value);
+    }
+  }
+
   // Generate each section individually
-  for (const section of PLAN_SECTIONS) {
+  for (const section of requestedSections) {
     console.log(`[PLAN] Generating section: ${section} ...`);
 
     try {
       let content = '';
+      const contextCandidates = Array.from(
+        new Set([conversationContext, compactConversationContext].filter(Boolean))
+      );
+      let generationError: unknown = null;
 
-      if (section === 'diagrams' || section === 'dbSchema') {
-        const supportingDocuments = ['prd', 'architecture', 'apiSpec', 'workflow', 'dbSchema']
-          .filter((key) => key !== section)
-          .map((key) => {
-            const value = sectionContent.get(key);
-            return value ? `## ${key}\n${value}` : '';
-          })
-          .filter(Boolean)
-          .join('\n\n');
+      for (let contextIndex = 0; contextIndex < contextCandidates.length; contextIndex += 1) {
+        const currentContext = contextCandidates[contextIndex];
 
-        content = await generateDiagramSectionContent(
-          section,
-          model,
-          settings,
-          conversationContext,
-          project.name,
-          project.description,
-          supportingDocuments
-        );
-      } else {
-        const { text } = await generateText({
-          model,
-          system: getSectionSystemPrompt(section),
-          prompt: `Here is the full conversation with the user about their project:\n\n${conversationContext}\n\nProject Name: ${project.name}\nProject Description: ${project.description || 'N/A'}\n\nWrite the "${section}" section now.`,
-          temperature: settings.temperature,
-        });
+        try {
+          if (section === 'diagrams' || section === 'dbSchema') {
+            const supportingDocuments = ['prd', 'architecture', 'apiSpec', 'workflow', 'dbSchema']
+              .filter((key) => key !== section)
+              .map((key) => {
+                const value = sectionContent.get(key);
+                return value ? `## ${key}\n${value}` : '';
+              })
+              .filter(Boolean)
+              .join('\n\n');
 
-        content = text.trim();
-        const fenceMatch = content.match(/^```(?:markdown|md)?\s*\n?([\s\S]*?)```\s*$/);
-        if (fenceMatch) {
-          content = fenceMatch[1].trim();
+            content = await generateDiagramSectionContent(
+              section,
+              model,
+              settings,
+              currentContext,
+              project.name,
+              project.description,
+              supportingDocuments
+            );
+          } else {
+            const { text } = await generateText({
+              model,
+              system: getSectionSystemPrompt(section),
+              prompt: `Here is the full conversation with the user about their project:\n\n${currentContext}\n\nProject Name: ${project.name}\nProject Description: ${project.description || 'N/A'}\n\nWrite the "${section}" section now.`,
+              temperature: settings.temperature,
+            });
+
+            content = text.trim();
+            const fenceMatch = content.match(/^```(?:markdown|md)?\s*\n?([\s\S]*?)```\s*$/);
+            if (fenceMatch) {
+              content = fenceMatch[1].trim();
+            }
+          }
+
+          generationError = null;
+          break;
+        } catch (error) {
+          generationError = error;
+          const canRetryWithSmallerContext =
+            contextIndex < contextCandidates.length - 1 && isTimeoutLikeError(error);
+
+          if (canRetryWithSmallerContext) {
+            console.warn(
+              `[PLAN] Timeout-like error while generating "${section}". Retrying with smaller context window.`
+            );
+            continue;
+          }
+
+          throw error;
         }
+      }
+
+      if (generationError) {
+        throw generationError;
       }
 
       // Save this section immediately to the DB
@@ -231,7 +336,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       });
 
       sectionsGenerated.push(section);
-  sectionContent.set(section, content);
+      sectionContent.set(section, content);
       console.log(`[PLAN] ✅ Section "${section}" saved (${content.length} chars)`);
     } catch (error) {
       console.error(`[PLAN] ❌ Section "${section}" failed:`, error);
@@ -241,7 +346,7 @@ export async function POST(request: NextRequest, { params }: Params) {
       await prisma.plan.update({
         where: { projectId: id },
         data: {
-          [section]: `> ⚠️ This section could not be generated automatically. You can edit it manually or try regenerating.\n\n_Error: ${String(error).substring(0, 200)}_`,
+          [section]: `> ⚠️ This section could not be generated automatically. You can edit it manually or try regenerating this section.\n\n_Error: ${String(error).substring(0, 200)}_`,
         },
       });
     }
@@ -262,9 +367,14 @@ export async function POST(request: NextRequest, { params }: Params) {
   // Fetch the final plan
   const plan = await prisma.plan.findUnique({ where: { projectId: id } });
 
-  console.log(`[PLAN] Generation complete. Success: ${sectionsGenerated.length}/${PLAN_SECTIONS.length}, Failed: ${sectionsFailed.length}`);
+  console.log(`[PLAN] Generation complete. Success: ${sectionsGenerated.length}/${requestedSections.length}, Failed: ${sectionsFailed.length}`);
 
-  return NextResponse.json({ plan, sectionsGenerated, sectionsFailed });
+  return NextResponse.json({
+    plan,
+    requestedSections,
+    sectionsGenerated,
+    sectionsFailed,
+  });
 }
 
 // PATCH /api/projects/:id/plan - Edit a single plan section
